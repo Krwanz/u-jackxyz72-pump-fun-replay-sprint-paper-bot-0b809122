@@ -83,6 +83,25 @@ interface CoinTrack {
 
 const tracks = new Map<string, CoinTrack>();
 
+// The earliest slot at which any open position goes stale. The fast path in
+// onBatch answers an empty batch without scanning anything while the current
+// slot is before this value: with no event, mark or fill, no price moved,
+// so only the slot-based stale exit could newly trigger. It is kept exact:
+// a buy lowers it to that position's stale slot, a sell or a completed
+// coin recomputes it from the tracks that are still holding.
+let nextStaleSlot = Number.POSITIVE_INFINITY;
+
+function recomputeNextStaleSlot(): void {
+  let next = Number.POSITIVE_INFINITY;
+  for (const t of tracks.values()) {
+    if (t.entryPrice > 0n) {
+      const stale = t.entrySlot + MAX_HOLD_SLOTS;
+      if (stale < next) next = stale;
+    }
+  }
+  nextStaleSlot = next;
+}
+
 function priceOf(virtualQuote: bigint, virtualToken: bigint): bigint {
   if (virtualToken <= 0n) return 0n;
   return (virtualQuote * SCALE) / virtualToken;
@@ -90,6 +109,21 @@ function priceOf(virtualQuote: bigint, virtualToken: bigint): bigint {
 
 await runBot({
   onBatch(state, batch) {
+    // Fast path: this slot moved nothing — no event, no mark, no fill — so
+    // no price moved and no position opened or closed. The only exit that
+    // can newly trigger is the slot-based stale exit, and it is not due
+    // while the slot is before the earliest stale deadline. Answering here
+    // skips the cash/position queries and both scans; roughly five of every
+    // six slots in the window are empty, so most batches end here.
+    if (
+      batch.events.length === 0 &&
+      batch.marks.length === 0 &&
+      batch.fills.length === 0 &&
+      batch.slot < nextStaleSlot
+    ) {
+      return [];
+    }
+
     const { caps } = state.hello;
     const txFee = state.txFeeLamports();
     let free = state.freeCashLamports();
@@ -141,21 +175,45 @@ await runBot({
         if (t.recent.length > RECENT_TRADES) t.recent.shift();
         if (t.entryPrice > 0n && p > t.peakPrice) t.peakPrice = p;
       } else if (e.event === 'CompleteEvent') {
+        const dead = tracks.get(e.mint);
         tracks.delete(e.mint);
+        if (dead !== undefined && dead.entryPrice > 0n) recomputeNextStaleSlot();
       }
     }
 
     // Exits first: free a slot (and realise the PnL) before deciding entries.
+    // A held coin's price and EMAs move only on its own TradeEvent, so a
+    // coin that did not trade this batch — and with no fill landing — has
+    // the same take-profit, stop-loss, trailing and decay outcome as the
+    // last scan; only its slot-based stale exit can newly trigger, and that
+    // is the one check it still gets. This skips the curve lookup and the
+    // fixed-point division for every quiet position on every batch.
+    let soldAny = false;
     for (const [mint, holding] of state.positions) {
+      const t = tracks.get(mint);
+      if (t === undefined || t.entryPrice <= 0n) continue;
+      const held = batch.slot - t.entrySlot;
+      if (batch.fills.length === 0 && !traded.has(mint)) {
+        if (held >= MAX_HOLD_SLOTS) {
+          orders.push({
+            side: 'sell',
+            mint,
+            token_amount: holding.token_amount,
+            max_slippage_bps: MAX_SLIPPAGE_BPS,
+          });
+          t.entryPrice = 0n;
+          t.peakPrice = 0n;
+          t.lastExitSlot = batch.slot;
+          soldAny = true;
+        }
+        continue;
+      }
       const curve = state.curves.get(mint);
       if (curve === undefined) continue;
       const price = priceOf(curve.virtual_quote_reserves, curve.virtual_token_reserves);
       if (price <= 0n) continue;
-      const t = tracks.get(mint);
-      if (t === undefined || t.entryPrice <= 0n) continue;
       const up = (price * 100n) / t.entryPrice;
       const offPeak = t.peakPrice > 0n ? (price * 100n) / t.peakPrice : 100n;
-      const held = batch.slot - t.entrySlot;
       const takeProfit = up >= TAKE_PROFIT_NUM;
       const stopLoss = up <= STOP_LOSS_NUM;
       const trailing = up >= TRAIL_ARM_NUM && offPeak <= TRAIL_NUM;
@@ -171,8 +229,10 @@ await runBot({
         t.entryPrice = 0n;
         t.peakPrice = 0n;
         t.lastExitSlot = batch.slot;
+        soldAny = true;
       }
     }
+    if (soldAny) recomputeNextStaleSlot();
 
     // Entries: only coins that traded in this batch, in event order, while
     // a position slot and cash remain.
@@ -209,6 +269,7 @@ await runBot({
       t.entryPrice = price;
       t.entrySlot = batch.slot;
       t.peakPrice = price;
+      if (batch.slot + MAX_HOLD_SLOTS < nextStaleSlot) nextStaleSlot = batch.slot + MAX_HOLD_SLOTS;
     }
 
     return orders;
